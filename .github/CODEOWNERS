@@ -1,0 +1,6 @@
+# CI and dependency entry points need the owner's review.
+# This file takes effect only when the branch protection rule
+# "Require review from Code Owners" is enabled.
+.github/ @fuleinist
+package.json @fuleinist
+.npmrc @fuleinist

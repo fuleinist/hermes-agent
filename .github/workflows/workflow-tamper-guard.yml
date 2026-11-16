@@ -1,0 +1,140 @@
+# Workflow tamper guard.
+#
+# Threat model (wfx-loot, Nov 2026): an attacker with a stolen but *valid* token opens a
+# probe PR, then plants a credential harvester through one of three routes:
+#   1. modifies an existing Actions workflow
+#   2. adds a new workflow file on a short-lived branch
+#   3. adds an npm install hook (preinstall/postinstall/prepare)
+# GitHub is not exploited. The token is valid, so this workflow does not try to detect
+# "bad actors". It makes those three routes impossible to land without a maintainer.
+#
+# Design notes:
+#   * No third-party `uses:` at all. Every step is bash plus the preinstalled `gh`, so there
+#     is nothing to pin and no action tag to squat.
+#   * `permissions` is read-only at workflow scope. This job must never hold a write token.
+#   * Untrusted values (PR title, branch, author) travel through `env:`, never inline
+#     `${{ }}` in a `run:` block. Inline interpolation of PR text is the injection bug this
+#     file exists to prevent.
+#   * Blocking: campaign indicators, or a sensitive path touched by a non-maintainer, or an
+#     npm install hook. Advisory: credential-harvest strings in added lines.
+
+name: Workflow tamper guard
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  guard:
+    name: guard
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      PR_NUM: ${{ github.event.pull_request.number }}
+      PR_TITLE: ${{ github.event.pull_request.title }}
+      PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+      ASSOC: ${{ github.event.pull_request.author_association }}
+    steps:
+      - name: Campaign indicators (blocking)
+        shell: bash
+        run: |
+          set -uo pipefail
+          echo "author=$PR_AUTHOR association=$ASSOC"
+          echo "head=$PR_HEAD_REF"
+          fail=0
+
+          if [[ "$PR_HEAD_REF" =~ ^wfx- ]]; then
+            echo "::error::branch matches wfx-* indicator"; fail=1
+          fi
+          if [[ "$PR_HEAD_REF" =~ ^chore/[a-z0-9]{8}$ ]]; then
+            echo "::error::branch matches chore/<8 random chars> indicator"; fail=1
+          fi
+          if [[ "$PR_HEAD_REF" =~ ^ci-check-[0-9]{4}$ ]]; then
+            echo "::error::branch matches ci-check-#### indicator"; fail=1
+          fi
+          if [[ "${PR_TITLE,,}" == "docs: dependency audit notes" ]]; then
+            echo "::error::PR title matches the campaign's probe title"; fail=1
+          fi
+
+          commits=$(gh api --paginate "repos/$REPO/pulls/$PR_NUM/commits" \
+                    --jq '.[].commit.message' 2>/dev/null || true)
+          while IFS= read -r msg; do
+            case "${msg,,}" in
+              *"ci: refresh build cache"*|*"chore: add ci helper"*|*"chore: add dependency audit workflow"*)
+                echo "::error::commit message matches a campaign indicator: $msg"; fail=1 ;;
+            esac
+          done <<< "$commits"
+
+          exit "$fail"
+
+      - name: Sensitive paths (blocking for non-maintainers)
+        shell: bash
+        run: |
+          set -uo pipefail
+          files=$(gh api --paginate "repos/$REPO/pulls/$PR_NUM/files" --jq '.[].filename' 2>/dev/null || true)
+          [ -z "$files" ] && { echo "no changed files reported"; exit 0; }
+
+          sensitive=""
+          while IFS= read -r f; do
+            case "$f" in
+              .github/workflows/*|.github/actions/*|action.yml|action.yaml|package.json|.npmrc|.pypirc|pyproject.toml|setup.py|setup.cfg|*.sh|*.ps1|*.bat|*.cmd|Makefile|Dockerfile|Dockerfile.*|*.mk)
+                sensitive="$sensitive$f"$'\n' ;;
+            esac
+          done <<< "$files"
+
+          if [ -z "$sensitive" ]; then
+            echo "no CI, dependency or script files touched"
+            exit 0
+          fi
+
+          echo "sensitive files touched:"; printf '%s' "$sensitive"
+
+          case "$ASSOC" in
+            OWNER|MEMBER|COLLABORATOR)
+              echo "author association $ASSOC is trusted; not blocking"; exit 0 ;;
+          esac
+
+          printf '::error::This PR changes CI, dependency or script files and the author (%s) is %s, not a maintainer.\n' "$PR_AUTHOR" "$ASSOC"
+          echo "::error::A maintainer must apply these changes, or review and merge them deliberately."
+          exit 1
+
+      - name: npm install hooks (blocking)
+        shell: bash
+        run: |
+          set -uo pipefail
+          added=$(gh api --paginate "repos/$REPO/pulls/$PR_NUM/files" \
+                  --jq '.[] | select(.filename | test("(^|/)package\\.json$")) | .patch // ""' 2>/dev/null || true)
+          if [ -z "$added" ]; then
+            echo "no package.json patch in this PR"; exit 0
+          fi
+          hits=$(printf '%s\n' "$added" | grep -E '^\+.*"(pre|post)?(install|prepare|prepack)"\s*:' || true)
+          if [ -n "$hits" ]; then
+            echo "::error::this PR adds or edits an npm lifecycle hook, which runs on install:"
+            printf '%s\n' "$hits"
+            exit 1
+          fi
+          echo "no npm lifecycle hook added"
+
+      - name: Credential-harvest patterns (advisory)
+        shell: bash
+        run: |
+          set -uo pipefail
+          patch=$(gh api --paginate "repos/$REPO/pulls/$PR_NUM/files" \
+                  --jq '.[] | (.patch // empty)' 2>/dev/null || true)
+          [ -z "$patch" ] && { echo "no textual patch to scan"; exit 0; }
+
+          patterns='169\.254\.169\.254|ACTIONS_ID_TOKEN_REQUEST|\.aws/credentials|\.ssh/id_|\.npmrc|\.pypirc|\.docker/config\.json|\.kube/config|printenv|env \||base64 -d|curl[^|]*\|\s*(ba)?sh|vault kv|terraform\.tfstate'
+          hits=$(printf '%s\n' "$patch" | grep -E "^\+.*($patterns)" || true)
+
+          if [ -n "$hits" ]; then
+            echo "::warning::added lines contain strings this campaign harvests or abuses. Advisory only, review before merge."
+            printf '%s\n' "$hits" | head -40
+          else
+            echo "no credential-harvest strings in added lines"
+          fi

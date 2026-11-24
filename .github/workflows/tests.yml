@@ -27,9 +27,11 @@ jobs:
 
       - name: Install dependencies
         run: |
-          uv venv .venv --python 3.11
-          source .venv/bin/activate
-          uv pip install -e ".[all,dev]"
+          # Install from uv.lock. An unpinned resolve ignores the lock, so an upstream
+          # release changes test behaviour without a commit to this repo.
+          # `--locked` is not usable here: uv.lock predates the `yc-bench` extra, which
+          # requires Python >= 3.12, so a lock check reports the project as unsatisfiable.
+          uv sync --frozen --extra all --python 3.11
 
       - name: Run tests
         run: |
